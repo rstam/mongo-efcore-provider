@@ -173,15 +173,14 @@ public class MongoDatabaseWrapper : Database
     {
         var entityType = entry.EntityType;
         var entitySerializer = (IBsonDocumentSerializer)EntitySerializer.Create(entityType);
-        var document = ToBsonDocument(entry, entitySerializer, entityType.GetProperties());
 
-        var pk = entityType.FindPrimaryKey();
-        if (pk.Properties.Count > 1)
+        var document = new BsonDocument();
+        using (var writer = new BsonDocumentWriter(document))
         {
-            // TODO: should rework this once we are ready for proper composite key implementation
-            // Have to synthesize composite _id field
-            var pkDocument = ToBsonDocument(entry, entitySerializer, pk.Properties);
-            document["_id"] = pkDocument;
+            writer.WriteStartDocument();
+            SerializePrimaryKey(writer, entry, entitySerializer);
+            SerializeProperties(writer, entry, entitySerializer, entityType.GetProperties().Where(p => !p.IsPrimaryKey()));
+            writer.WriteEndDocument();
         }
 
         var model = new InsertOneModel<BsonDocument>(document);
@@ -203,12 +202,15 @@ public class MongoDatabaseWrapper : Database
         var entityType = entry.EntityType;
         var entitySerializer = (IBsonDocumentSerializer)EntitySerializer.Create(entityType);
 
-        var fieldValues = ToBsonDocument(entry, entitySerializer, entityType.GetProperties().Where(p => entry.IsModified(p)));
-
+        var idFilter = CreateIdFilter(entitySerializer, entry);
+        var fieldValues = new BsonDocument();
+        using (var writer = new BsonDocumentWriter(fieldValues))
+        {
+            SerializeProperties(writer, entry, entitySerializer, entityType.GetProperties().Where(p => entry.IsModified(p)));
+        }
         var updateDocument = new BsonDocument("$set", fieldValues);
         var updateDefinition = new BsonDocumentUpdateDefinition<BsonDocument>(updateDocument);
 
-        var idFilter = CreateIdFilter(entitySerializer, entry);
         var model = new UpdateOneModel<BsonDocument>(idFilter, updateDefinition);
         return new MongoUpdate(collectionName, model);
     }
@@ -217,15 +219,8 @@ public class MongoDatabaseWrapper : Database
         IBsonDocumentSerializer entitySerializer,
         IUpdateEntry entry)
     {
-        var primaryKey = entry.EntityType.FindPrimaryKey();
-        BsonValue idValue = ToBsonDocument(entry, entitySerializer, primaryKey.Properties);
-        if (primaryKey.Properties.Count == 1)
-        {
-            // if PK consist of single field - have to unwrap it
-            idValue = idValue["_id"];
-        }
-
-        return Builders<BsonDocument>.Filter.Eq("_id", idValue);
+        var serializedIdValue = SerializePrimaryKey(entry, entitySerializer);
+        return Builders<BsonDocument>.Filter.Eq("_id", serializedIdValue);
     }
 
     private static BsonSerializationInfo GetPropertySerializationInfo(
@@ -290,29 +285,54 @@ public class MongoDatabaseWrapper : Database
         return documentsAffected;
     }
 
-    private static BsonDocument ToBsonDocument(IUpdateEntry entry, IBsonDocumentSerializer entitySerializer, IEnumerable<IPropertyBase> properties)
+    private static BsonValue SerializePrimaryKey(IUpdateEntry entry, IBsonDocumentSerializer entitySerializer)
     {
         var document = new BsonDocument();
         using (var writer = new BsonDocumentWriter(document))
         {
             writer.WriteStartDocument();
-
-            foreach (var property in properties)
-            {
-                var propertyValue = entry.GetCurrentValue(property);
-                var propertySerializationInfo = GetPropertySerializationInfo(entitySerializer, property);
-                var elementName = propertySerializationInfo.ElementName;
-                var propertySerializer = propertySerializationInfo.Serializer;
-                var context = BsonSerializationContext.CreateRoot(writer);
-
-                writer.WriteName(elementName);
-                propertySerializer.Serialize(context, propertyValue);
-            }
-
+            SerializePrimaryKey(writer, entry, entitySerializer);
             writer.WriteEndDocument();
         }
+        return document["_id"];
+    }
 
-        return document;
+    private static void SerializePrimaryKey(IBsonWriter writer, IUpdateEntry entry, IBsonDocumentSerializer entitySerializer)
+    {
+        var primaryKey = entry.EntityType.FindPrimaryKey();
+        if (primaryKey == null)
+        {
+            throw new InvalidOperationException("No primary key found.");
+        }
+
+        var primaryKeyProperties = primaryKey.Properties;
+        if (primaryKeyProperties.Count == 1)
+        {
+            SerializeProperties(writer, entry, entitySerializer, primaryKeyProperties);
+        }
+        else
+        {
+            writer.WriteName("_id");
+            writer.WriteStartDocument();
+            SerializeProperties(writer, entry, entitySerializer, primaryKeyProperties);
+            writer.WriteEndDocument();
+        }
+    }
+
+    private static void SerializeProperties(IBsonWriter writer, IUpdateEntry entry, IBsonDocumentSerializer entitySerializer, IEnumerable<IPropertyBase> properties)
+    {
+        var context = BsonSerializationContext.CreateRoot(writer);
+
+        foreach (var property in properties)
+        {
+            var propertyValue = entry.GetCurrentValue(property);
+            var propertySerializationInfo = GetPropertySerializationInfo(entitySerializer, property);
+            var elementName = propertySerializationInfo.ElementName;
+            var propertySerializer = propertySerializationInfo.Serializer;
+
+            writer.WriteName(elementName);
+            propertySerializer.Serialize(context, propertyValue);
+        }
     }
 
     private static IEnumerable<MongoUpdateBatch> BatchUpdatesByCollection(IEnumerable<MongoUpdate> updates)
